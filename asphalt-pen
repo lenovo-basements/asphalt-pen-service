@@ -1,0 +1,185 @@
+#!/usr/bin/env python3
+"""
+asphalt-pen: active pen mode for the Lenovo Legion Y700 Gen 2 (TB320FC, asphalt).
+
+The NT36523N touch firmware only scans for an active pen in "pen mode"
+(novatek-nt36523n sysfs attribute pen_mode). Stock Android turns it on while
+its Bluetooth pen is connected and off when it goes away; this does the same
+from udev, with no daemon:
+
+    asphalt-pen status          what the touchscreen, config and pens say
+    asphalt-pen sync            apply the policy (run by udev)
+    asphalt-pen force on|off    set pen mode now, until the next sync
+
+Policy (/etc/asphalt-pen.conf):
+
+    MODE=auto     pen mode while a matching Bluetooth input device exists
+    MODE=on       always (e.g. a pen without Bluetooth)
+    MODE=off      never
+    PENS="*pen*"  case-insensitive globs on the Bluetooth input device name
+    HAPTIC=toggle y700-hapticd effect when pen mode turns on ("" for none)
+
+ASPHALT_PEN_ROOT prefixes every path (tests).
+"""
+import fnmatch
+import glob
+import os
+import shlex
+import sys
+
+ROOT = os.environ.get("ASPHALT_PEN_ROOT", "")
+DRIVER = "/sys/bus/spi/drivers/novatek-nt36523n"
+INPUTS = "/sys/class/input"
+CONFIG = "/etc/asphalt-pen.conf"
+FIFO = "/run/y700-hapticd/fifo"
+BUS_BLUETOOTH = 0x0005
+DEFAULTS = {"MODE": "auto", "PENS": "*pen*", "HAPTIC": "toggle"}
+MODES = ("auto", "on", "off")
+
+
+def path(p):
+    return ROOT + p
+
+
+def read(p, default=None):
+    try:
+        with open(p) as f:
+            return f.read().strip()
+    except OSError:
+        return default
+
+
+def load_config():
+    """Shell-style KEY=value lines; unknown keys are ignored."""
+    conf = dict(DEFAULTS)
+    text = read(path(CONFIG), "")
+    for number, line in enumerate(text.splitlines(), 1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        key, sep, value = line.partition("=")
+        key = key.strip()
+        if not sep or key not in conf:
+            continue
+        try:
+            words = shlex.split(value, comments=True)
+        except ValueError as e:
+            raise SystemExit(f"{CONFIG}:{number}: {e}")
+        conf[key] = " ".join(words) if key != "PENS" else words
+    if isinstance(conf["PENS"], str):
+        conf["PENS"] = shlex.split(conf["PENS"])
+    if conf["MODE"] not in MODES:
+        raise SystemExit(f"{CONFIG}: MODE must be one of {', '.join(MODES)}, not {conf['MODE']!r}")
+    return conf
+
+
+def touchscreens():
+    """pen_mode attributes of bound NT36523N devices that have a pen."""
+    return sorted(glob.glob(path(DRIVER + "/*/pen_mode")))
+
+
+def bluetooth_pens(patterns):
+    """Names of Bluetooth input devices matching the PENS globs."""
+    found = set()
+    for dev in glob.glob(path(INPUTS + "/input*")):
+        bus = read(dev + "/id/bustype")
+        name = read(dev + "/name")
+        if bus is None or name is None:
+            continue            # gone while we looked (remove events)
+        try:
+            if int(bus, 16) != BUS_BLUETOOTH:
+                continue
+        except ValueError:
+            continue
+        if any(fnmatch.fnmatchcase(name.lower(), p.lower()) for p in patterns):
+            found.add(name)
+    return sorted(found)
+
+
+def wanted(conf, pens):
+    return {"on": True, "off": False}.get(conf["MODE"], bool(pens))
+
+
+def haptic(effect):
+    if not effect:
+        return
+    try:
+        fd = os.open(path(FIFO), os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        return                  # no y700-hapticd: fine
+    try:
+        os.write(fd, effect.encode() + b"\n")
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def apply(mode, effect=""):
+    """Write pen_mode where it differs; returns the attributes changed."""
+    changed = []
+    for node in touchscreens():
+        if read(node) == str(int(mode)):
+            continue
+        try:
+            with open(node, "w") as f:
+                f.write(f"{int(mode)}\n")
+        except OSError as e:
+            print(f"asphalt-pen: {node}: {e.strerror}", file=sys.stderr)
+            continue
+        changed.append(node)
+    if changed and mode:
+        haptic(effect)
+    return changed
+
+
+def cmd_status():
+    conf = load_config()
+    pens = bluetooth_pens(conf["PENS"])
+    nodes = touchscreens()
+    print(f"policy:  MODE={conf['MODE']} PENS={' '.join(map(shlex.quote, conf['PENS']))}")
+    print(f"pens:    {', '.join(pens) if pens else 'none connected'}")
+    print(f"wanted:  pen mode {'on' if wanted(conf, pens) else 'off'}")
+    if not nodes:
+        print("touch:   no NT36523N with pen_mode (old kernel, or no novatek,pen-support)")
+        return 1
+    for node in nodes:
+        battery = read(os.path.join(os.path.dirname(node), "pen_battery"), "?")
+        state = {"1": "on", "0": "off"}.get(read(node), "?")
+        print(f"touch:   {os.path.basename(os.path.dirname(node))} pen mode {state}, "
+              f"last pen battery byte {battery}")
+    return 0
+
+
+def cmd_sync():
+    conf = load_config()
+    mode = wanted(conf, bluetooth_pens(conf["PENS"]))
+    for node in apply(mode, conf["HAPTIC"]):
+        print(f"asphalt-pen: pen mode {'on' if mode else 'off'} ({node})")
+    return 0
+
+
+def cmd_force(arg):
+    if arg not in ("on", "off"):
+        return usage()
+    apply(arg == "on", load_config()["HAPTIC"])
+    return 0
+
+
+def usage():
+    print("usage: asphalt-pen [status] | sync | force on|off", file=sys.stderr)
+    return 2
+
+
+def main(argv):
+    if argv[1:] in (["status"], []):
+        return cmd_status()
+    if argv[1:] == ["sync"]:
+        return cmd_sync()
+    if len(argv) == 3 and argv[1] == "force":
+        return cmd_force(argv[2])
+    return usage()
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

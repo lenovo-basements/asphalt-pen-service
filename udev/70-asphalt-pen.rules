@@ -1,0 +1,6 @@
+ACTION=="add", SUBSYSTEM=="input", KERNEL=="input[0-9]*", ATTR{id/bustype}=="0005", \
+	RUN+="@BINDIR@/asphalt-pen sync"
+ACTION=="remove", SUBSYSTEM=="input", KERNEL=="input[0-9]*", \
+	RUN+="@BINDIR@/asphalt-pen sync"
+ACTION=="add|bind", SUBSYSTEM=="spi", DRIVER=="novatek-nt36523n", \
+	RUN+="@BINDIR@/asphalt-pen sync"
